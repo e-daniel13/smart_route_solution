@@ -1,0 +1,463 @@
+import { useState, useMemo } from 'react'
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet'
+import 'leaflet/dist/leaflet.css'
+import axios from 'axios'
+import L from 'leaflet'
+import markerIcon from 'leaflet/dist/images/marker-icon.png'
+import markerShadow from 'leaflet/dist/images/marker-shadow.png'
+
+L.Icon.Default.mergeOptions({ iconUrl: markerIcon, shadowUrl: markerShadow })
+
+const ORS_KEY = import.meta.env.VITE_ORS_API_KEY
+
+// ── Mode config ────────────────────────────────────────────────
+const MODES = {
+  drive:   { color: '#ef4444', label: '🚗 Drive'   },
+  transit: { color: '#a855f7', label: '🚌 Transit'  },
+  cycle:   { color: '#f97316', label: '🚲 Cycle'    },
+  walk:    { color: '#22c55e', label: '🚶 Walk'     },
+}
+
+// ── CO₂ emissions g/km per mode (IPCC / NRCan sources) ────────
+const CO2_PER_KM = {
+  drive:   171,
+  transit: 89,
+  cycle:   0,
+  walk:    0,
+}
+
+// ── Transit fare constants ─────────────────────────────────────
+function transitFare(distanceKm) {
+  if (distanceKm < 30) return 3.50   // TTC single fare
+  return 11.40                        // GO Transit Hamilton→Toronto approx
+}
+
+// ── Decode ORS encoded polyline → [[lat,lng], ...] ────────────
+function decodePolyline(encoded) {
+  let index = 0, lat = 0, lng = 0
+  const coords = []
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5 } while (b >= 0x20)
+    lat += result & 1 ? ~(result >> 1) : result >> 1
+    shift = 0; result = 0
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5 } while (b >= 0x20)
+    lng += result & 1 ? ~(result >> 1) : result >> 1
+    coords.push([lat / 1e5, lng / 1e5])
+  }
+  return coords
+}
+
+// ── Auto-fit map ───────────────────────────────────────────────
+function MapFitter({ bounds }) {
+  const map = useMap()
+  if (bounds) map.fitBounds(bounds, { padding: [40, 40] })
+  return null
+}
+
+// ── Formatters ─────────────────────────────────────────────────
+function formatTime(seconds) {
+  const h = Math.floor(seconds / 3600)
+  const m = Math.floor((seconds % 3600) / 60)
+  return h > 0 ? `${h}h ${m}m` : `${m}m`
+}
+function formatDist(metres) {
+  return metres >= 1000 ? `${(metres / 1000).toFixed(1)} km` : `${Math.round(metres)} m`
+}
+function formatCost(dollars) {
+  return dollars === 0 ? 'Free' : `$${dollars.toFixed(2)}`
+}
+function formatCO2(grams) {
+  return grams >= 1000 ? `${(grams / 1000).toFixed(2)} kg` : `${Math.round(grams)} g`
+}
+
+// ── ORS route fetch ────────────────────────────────────────────
+async function fetchORSRoute(profile, start, end) {
+  const res = await axios.post(
+    `https://api.openrouteservice.org/v2/directions/${profile}`,
+    { coordinates: [start, end], preference: 'fastest' },
+    { headers: { Authorization: ORS_KEY, 'Content-Type': 'application/json' } }
+  )
+  const route = res.data.routes[0]
+  const coords = decodePolyline(route.geometry)
+  return { coords, distance: route.summary.distance, duration: route.summary.duration }
+}
+
+// ── Transit estimate ───────────────────────────────────────────
+async function fetchTransitRoute(oLat, oLng, dLat, dLng) {
+  const driving = await fetchORSRoute('driving-car', [oLng, oLat], [dLng, dLat])
+  const distanceKm = driving.distance / 1000
+  let multiplier, waitSeconds
+  if (distanceKm < 5)       { multiplier = 2.0; waitSeconds = 5 * 60 }
+  else if (distanceKm < 30) { multiplier = 1.7; waitSeconds = 8 * 60 }
+  else                      { multiplier = 1.4; waitSeconds = 15 * 60 }
+  return {
+    coords:     driving.coords,
+    duration:   (driving.duration * multiplier) + waitSeconds,
+    distance:   driving.distance * 1.1,
+    isEstimate: true,
+  }
+}
+
+// ── Geocode ────────────────────────────────────────────────────
+async function geocode(address) {
+  const res = await axios.get('https://api.openrouteservice.org/geocode/search', {
+    params: { api_key: ORS_KEY, text: address, size: 1 }
+  })
+  const feature = res.data.features[0]
+  if (!feature) throw new Error(`Could not find: "${address}"`)
+  return feature.geometry.coordinates
+}
+
+// ── Scoring: normalize 0–100 where 100 = best ─────────────────
+function scoreRoutes(routes, weights, fuelPrice, fuelEfficiency) {
+  const modeKeys = Object.keys(routes)
+
+  // Calculate raw values per mode
+  const raw = {}
+  modeKeys.forEach(key => {
+    const r = routes[key]
+    const distKm = r.distance / 1000
+    let cost = 0
+    if (key === 'drive') {
+      cost = (distKm / 100) * fuelEfficiency * fuelPrice
+    } else if (key === 'transit') {
+      cost = transitFare(distKm)
+    }
+    // cycle and walk are free
+    const co2 = (CO2_PER_KM[key] ?? 0) * distKm
+
+    raw[key] = { time: r.duration, cost, co2 }
+  })
+
+  // Find min/max for each metric across all modes
+  const times = modeKeys.map(k => raw[k].time)
+  const costs = modeKeys.map(k => raw[k].cost)
+  const co2s  = modeKeys.map(k => raw[k].co2)
+
+  const minMax = (arr) => ({ min: Math.min(...arr), max: Math.max(...arr) })
+  const tmm = minMax(times)
+  const cmm = minMax(costs)
+  const emm = minMax(co2s)
+
+  // Normalize: 100 = best (lowest), 0 = worst
+  const normalize = (val, { min, max }) =>
+    max === min ? 100 : 100 - ((val - min) / (max - min)) * 100
+
+  const scored = {}
+  modeKeys.forEach(key => {
+    const { time, cost, co2 } = raw[key]
+    const timeScore = normalize(time, tmm)
+    const costScore = normalize(cost, cmm)
+    const co2Score  = normalize(co2, emm)
+
+    const { timeW, costW, co2W } = weights
+    const total = timeW + costW + co2W
+    const smart = (timeScore * timeW + costScore * costW + co2Score * co2W) / total
+
+    scored[key] = {
+      ...routes[key],
+      cost,
+      co2,
+      timeScore:  Math.round(timeScore),
+      costScore:  Math.round(costScore),
+      co2Score:   Math.round(co2Score),
+      smartScore: Math.round(smart),
+    }
+  })
+
+  return scored
+}
+
+// ── Main component ─────────────────────────────────────────────
+export default function App() {
+  const [origin, setOrigin]           = useState('')
+  const [destination, setDestination] = useState('')
+  const [markers, setMarkers]         = useState([])
+  const [routes, setRoutes]           = useState({})
+  const [loading, setLoading]         = useState(false)
+  const [error, setError]             = useState('')
+  const [bounds, setBounds]           = useState(null)
+  const [activeMode, setActiveMode]   = useState(null)
+  const [showSettings, setShowSettings] = useState(false)
+
+  // ── User-editable vehicle settings ──
+  const [fuelPrice, setFuelPrice]           = useState(1.65)   // $/L Ontario avg
+  const [fuelEfficiency, setFuelEfficiency] = useState(9.0)    // L/100km avg car
+
+  // ── Scoring weights (out of 100 each, don't need to sum to 100) ──
+  const [weights, setWeights] = useState({ timeW: 33, costW: 33, co2W: 34 })
+
+  // ── Compute scores reactively whenever routes or weights change ──
+  const scored = useMemo(() => {
+    if (Object.keys(routes).length === 0) return {}
+    return scoreRoutes(routes, weights, fuelPrice, fuelEfficiency)
+  }, [routes, weights, fuelPrice, fuelEfficiency])
+
+  // Find the best mode
+  const bestMode = Object.keys(scored).length > 0
+    ? Object.entries(scored).reduce((a, b) => a[1].smartScore > b[1].smartScore ? a : b)[0]
+    : null
+
+  async function handleSearch() {
+    setError('')
+    setRoutes({})
+    setLoading(true)
+    try {
+      const [oLng, oLat] = await geocode(origin)
+      const [dLng, dLat] = await geocode(destination)
+
+      setMarkers([
+        { lat: oLat, lng: oLng, label: `Start: ${origin}` },
+        { lat: dLat, lng: dLng, label: `End: ${destination}` }
+      ])
+
+      const [drive, cycle, walk, transit] = await Promise.all([
+        fetchORSRoute('driving-car',     [oLng, oLat], [dLng, dLat]),
+        fetchORSRoute('cycling-regular', [oLng, oLat], [dLng, dLat]),
+        fetchORSRoute('foot-walking',    [oLng, oLat], [dLng, dLat]),
+        fetchTransitRoute(oLat, oLng, dLat, dLng).catch(() => null),
+      ])
+
+      const newRoutes = { drive, cycle, walk }
+      if (transit) newRoutes.transit = transit
+      setRoutes(newRoutes)
+
+      const allCoords = Object.values(newRoutes).flatMap(r => r.coords)
+      setBounds(L.latLngBounds(allCoords))
+    } catch (e) {
+      setError(e.response?.data?.error?.message || e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', fontFamily: 'sans-serif' }}>
+
+      {/* ── Search bar ── */}
+      <div style={{
+        padding: '12px 20px', background: '#0f172a', color: 'white',
+        display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap'
+      }}>
+        <h2 style={{ margin: 0, fontSize: 17 }}>🗺 Commute Dashboard</h2>
+        <input
+          placeholder="Origin"
+          value={origin}
+          onChange={e => setOrigin(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && handleSearch()}
+          style={inputStyle}
+        />
+        <span style={{ color: '#475569' }}>→</span>
+        <input
+          placeholder="Destination"
+          value={destination}
+          onChange={e => setDestination(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && handleSearch()}
+          style={inputStyle}
+        />
+        <button onClick={handleSearch} disabled={loading} style={btnStyle}>
+          {loading ? 'Fetching…' : 'Search'}
+        </button>
+        <button
+          onClick={() => setShowSettings(s => !s)}
+          style={{ ...btnStyle, background: '#334155', color: 'white', marginLeft: 'auto' }}
+        >
+          ⚙ Settings
+        </button>
+        {error && <span style={{ color: '#f87171', fontSize: 13 }}>⚠ {error}</span>}
+      </div>
+
+      {/* ── Settings panel ── */}
+      {showSettings && (
+        <div style={{
+          background: '#1e293b', borderBottom: '1px solid #334155',
+          padding: '14px 20px', display: 'flex', gap: 32, flexWrap: 'wrap', alignItems: 'flex-start'
+        }}>
+          {/* Vehicle settings */}
+          <div>
+            <div style={{ color: '#94a3b8', fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>
+              VEHICLE
+            </div>
+            <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
+              <label style={labelStyle}>
+                Fuel price ($/L)
+                <input
+                  type="number" step="0.01" min="0"
+                  value={fuelPrice}
+                  onChange={e => setFuelPrice(parseFloat(e.target.value) || 0)}
+                  style={numInputStyle}
+                />
+              </label>
+              <label style={labelStyle}>
+                Fuel efficiency (L/100km)
+                <input
+                  type="number" step="0.1" min="0"
+                  value={fuelEfficiency}
+                  onChange={e => setFuelEfficiency(parseFloat(e.target.value) || 0)}
+                  style={numInputStyle}
+                />
+              </label>
+            </div>
+          </div>
+
+          {/* Scoring weights */}
+          <div style={{ flex: 1, minWidth: 280 }}>
+            <div style={{ color: '#94a3b8', fontSize: 11, fontWeight: 700, letterSpacing: 1, marginBottom: 10 }}>
+              WHAT MATTERS TO YOU
+            </div>
+            {[
+              { key: 'timeW', label: '⏱ Speed',       color: '#38bdf8' },
+              { key: 'costW', label: '💰 Cost',        color: '#4ade80' },
+              { key: 'co2W',  label: '🌿 Environment', color: '#a3e635' },
+            ].map(({ key, label, color }) => (
+              <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                <span style={{ color: 'white', fontSize: 13, width: 110 }}>{label}</span>
+                <input
+                  type="range" min="0" max="100"
+                  value={weights[key]}
+                  onChange={e => setWeights(w => ({ ...w, [key]: Number(e.target.value) }))}
+                  style={{ flex: 1, accentColor: color }}
+                />
+                <span style={{ color, fontSize: 13, width: 32, textAlign: 'right' }}>
+                  {weights[key]}
+                </span>
+              </div>
+            ))}
+            <div style={{ color: '#475569', fontSize: 11, marginTop: 4 }}>
+              Weights are relative — they don't need to add up to 100.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Route cards ── */}
+      {Object.keys(scored).length > 0 && (
+        <div style={{
+          display: 'flex', gap: 10, padding: '10px 16px',
+          background: '#1e293b', borderBottom: '1px solid #334155',
+          flexWrap: 'wrap'
+        }}>
+          {Object.entries(MODES).map(([key, mode]) => {
+            const r = scored[key]
+            if (!r) return (
+              <div key={key} style={{
+                flex: 1, minWidth: 140, padding: '10px 14px', borderRadius: 8,
+                background: '#0f172a', border: '2px solid #1e293b', opacity: 0.4
+              }}>
+                <div style={{ color: mode.color, fontWeight: 700, fontSize: 14 }}>{mode.label}</div>
+                <div style={{ color: '#64748b', fontSize: 12, marginTop: 4 }}>Not available</div>
+              </div>
+            )
+
+            const isActive  = activeMode === key
+            const isBest    = key === bestMode
+
+            return (
+              <div
+                key={key}
+                onMouseEnter={() => setActiveMode(key)}
+                onMouseLeave={() => setActiveMode(null)}
+                style={{
+                  flex: 1, minWidth: 140, padding: '10px 14px', borderRadius: 8,
+                  background: isActive ? mode.color + '22' : '#0f172a',
+                  border: `2px solid ${isBest ? mode.color : isActive ? mode.color : '#334155'}`,
+                  cursor: 'pointer', transition: 'all 0.15s',
+                  position: 'relative'
+                }}
+              >
+                {/* Best badge */}
+                {isBest && (
+                  <div style={{
+                    position: 'absolute', top: -10, right: 8,
+                    background: mode.color, color: '#0f172a',
+                    fontSize: 10, fontWeight: 800, padding: '2px 7px',
+                    borderRadius: 99, letterSpacing: 0.5
+                  }}>
+                    ★ BEST
+                  </div>
+                )}
+
+                <div style={{ color: mode.color, fontWeight: 700, fontSize: 14 }}>{mode.label}</div>
+
+                {/* Smart score bar */}
+                <div style={{ margin: '6px 0 4px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                    <span style={{ color: '#94a3b8', fontSize: 10 }}>Smart Score</span>
+                    <span style={{ color: 'white', fontSize: 11, fontWeight: 700 }}>{r.smartScore}</span>
+                  </div>
+                  <div style={{ background: '#1e293b', borderRadius: 4, height: 5 }}>
+                    <div style={{
+                      background: mode.color, borderRadius: 4,
+                      height: 5, width: `${r.smartScore}%`, transition: 'width 0.3s'
+                    }} />
+                  </div>
+                </div>
+
+                <div style={{ color: '#e2e8f0', fontSize: 12, marginTop: 6 }}>⏱ {formatTime(r.duration)} <span style={{ color: '#475569' }}>({r.timeScore})</span></div>
+                <div style={{ color: '#e2e8f0', fontSize: 12, marginTop: 2 }}>💰 {formatCost(r.cost)} <span style={{ color: '#475569' }}>({r.costScore})</span></div>
+                <div style={{ color: '#e2e8f0', fontSize: 12, marginTop: 2 }}>🌿 {formatCO2(r.co2)} <span style={{ color: '#475569' }}>({r.co2Score})</span></div>
+                <div style={{ color: '#94a3b8', fontSize: 11, marginTop: 4 }}>📍 {formatDist(r.distance)}</div>
+
+                {r.isEstimate && (
+                  <div style={{ color: '#475569', fontSize: 10, marginTop: 4, fontStyle: 'italic' }}>
+                    * transit estimated
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* ── Map ── */}
+      <MapContainer center={[43.2557, -79.8711]} zoom={12} style={{ flex: 1 }}>
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
+        <MapFitter bounds={bounds} />
+
+        {Object.entries(MODES).map(([key, mode]) => {
+          const r = routes[key]
+          if (!r) return null
+          const isActive = activeMode === key
+          return (
+            <Polyline
+              key={key}
+              positions={r.coords}
+              pathOptions={{
+                color: mode.color,
+                weight: isActive ? 6 : 3,
+                opacity: activeMode && !isActive ? 0.2 : 0.85,
+              }}
+            />
+          )
+        })}
+
+        {markers.map((m, i) => (
+          <Marker key={i} position={[m.lat, m.lng]}>
+            <Popup>{m.label}</Popup>
+          </Marker>
+        ))}
+      </MapContainer>
+    </div>
+  )
+}
+
+const inputStyle = {
+  padding: '8px 12px', borderRadius: 6, border: 'none',
+  fontSize: 14, width: 200, outline: 'none', background: '#1e293b', color: 'white'
+}
+const btnStyle = {
+  padding: '8px 20px', borderRadius: 6, background: '#22c55e',
+  border: 'none', fontWeight: 'bold', cursor: 'pointer', fontSize: 14, color: '#0f172a'
+}
+const labelStyle = {
+  display: 'flex', flexDirection: 'column', gap: 5,
+  color: 'white', fontSize: 13
+}
+const numInputStyle = {
+  padding: '6px 10px', borderRadius: 6, border: '1px solid #334155',
+  background: '#0f172a', color: 'white', fontSize: 14, width: 110, outline: 'none'
+}
