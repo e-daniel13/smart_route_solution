@@ -1,16 +1,55 @@
-# React + Vite
+# 🧭 Smart Route Planner
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A route comparison app that helps you pick the best way to get from A to B. Enter a start and a destination, and it compares driving, transit, Uber, and walking side by side, then ranks them with a "smart score" based on what you care about most: speed, cost, or environmental impact.
 
-Currently, two official plugins are available:
+**[Live demo](#)** <!-- replace # with your deployed URL -->
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Highlights
 
-## React Compiler
+- Compares multiple transport modes on time, cost, and CO₂ emissions
+- Adjustable priority sliders re-rank the results instantly
+- Routes are drawn on an interactive map, with hover highlighting
+- Driving cost is calculated from your own fuel price and efficiency
+- One click from the top-ranked option to turn-by-turn navigation in Google Maps
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+**Built with:** React, Vite, Leaflet, OpenRouteService API
 
-## Expanding the ESLint configuration
+## Author / Contact
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+**Eliana Daniel** · [GitHub](https://github.com/e-daniel13)
+
+## Bug Tracker
+
+Found a bug or have an idea? Open an issue on [GitHub Issues](https://github.com/e-daniel13/smart_route_solution/issues).
+
+## Known Issues
+
+- Transit and Uber results are estimates derived from the driving route, not live data.
+- The map can re-fit its view while hovering over result cards.
+- If the walking request fails on a very long trip, the whole search fails.
+- The API key is bundled into the client code, so a free-tier key is recommended.
+- There is no automated test suite yet.
+
+## Build
+
+Requires Node.js and a free [OpenRouteService](https://openrouteservice.org/dev/#/signup) API key.
+
+```bash
+git clone https://github.com/e-daniel13/smart_route_solution.git
+cd smart_route_solution
+npm install
+echo "VITE_ORS_API_KEY=your_key_here" > .env
+npm run build
+```
+
+## Run
+
+```bash
+npm run dev
+```
+
+Then open the local URL shown in the terminal (usually http://localhost:5173).
+
+## Tests
+
+No test suite yet. Code style can be checked with `npm run lint`.
